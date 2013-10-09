@@ -1,0 +1,217 @@
+#!/usr/bin/python
+import os
+import sys
+import tempfile
+import shutil
+import hashlib
+import subprocess
+import string
+import apatch
+
+no_compile_exts = [ "a", "h", "o" ]
+
+class gcc:
+    def __init__(self, binary = "/usr/bin/gcc"):
+        self.binary = binary
+        self.debug = True
+
+    def launch(self, argv):
+        log("gcc: %s %s" % (self.binary, argv))
+        subprocess.check_call([self.binary] + argv)
+
+class gcc_unhandled_exception:
+    """Don't intercept the GCC call."""
+    pass
+
+class gcc_argp:
+    def __init__(self):
+        self.output = ""
+        self.no_link = False
+
+        self.sources = []
+        self.next_argv = []
+        self.argv = []
+
+    def __split_argument(self, arg, args):
+        for a in args:
+            if arg.startswith(a):
+                return (a, arg[len(a):])
+        return None;
+
+    def parse(self, argv):
+        self.argv = argv
+        it = iter(argv)
+
+        unhandled_options = ("-S", "-E", "--version")
+        options = ("-c", "-O", "-O1", "-O2", "-O3" , "-v", "-m32", "-shared")
+        options_arg = ("-o", "-D", "-U", "-L", "-l", "-I", "-V", "-std=")
+        ignored_arg_class = ("-f", "-W")
+        removed_options = ("-g")
+
+        try:
+            while True:
+                opt = it.next()
+
+                if opt in options:
+                    if opt == "-c":
+                        # Stop after assembly (produce .o file)
+                        self.no_link = True
+                    else:
+                        self.next_argv.append(opt)
+                elif opt.startswith(options_arg):
+                    (opt, optarg) = self.__split_argument(opt, options_arg)
+                    if len(optarg) == 0:
+                        try:
+                            optarg = it.next()
+                        except StopIteration:
+                            print >> sys.stderr, "'%s' requires an argument." % opt
+                            exit(1)
+
+                    if opt == "-o":
+                        self.output = optarg
+                    else:
+                        self.next_argv += [ opt + optarg ]
+                elif opt in removed_options:
+                    pass
+                elif opt in unhandled_options:
+                    raise gcc_unhandled_exception()
+                elif opt.startswith(ignored_arg_class):
+                    self.next_argv.append(opt)
+                elif opt.startswith("-") or opt.startswith("@"):
+                    print >> sys.stderr, "Error: Unknown option: %s" % (opt)
+                    exit(1)
+                else:
+                    self.sources.append(opt)
+
+        except StopIteration:
+            pass
+
+def file_hash(filename):
+    hf = hashlib.sha256()
+    file = open(filename, "r")
+
+    for l in file:
+        hf.update(l)
+
+    file.close()
+
+    return hf.hexdigest()
+
+def extension(filename):
+    name_pair = string.rsplit(filename, ".", 1)
+    return name_pair[1] if len(name_pair) > 1 else None
+
+def new_extension(filename, ext):
+    name_parts = string.rsplit(filename, ".", 1)
+    return "%s.%s" % (name_parts[0], ext)
+
+def log(msg):
+    if log_file != None:
+        print >> log_file, msg
+
+args = gcc_argp()
+gcc = gcc()
+
+# Read environment variables and do sanity checking
+profile_dir = os.environ.get("CWRAPP_DIR",
+                             "%s/.cwrapp/" % os.environ["HOME"])
+patch_name = os.environ.get("CWRAPP_PATCH", None)
+patch_binary = os.environ.get("CWRAPP_BINARY", None)
+gcc_prefix = os.environ.get("CWRAPP_GCC", "/usr/bin")
+log_name = os.environ.get("CWRAPP_LOG", None)
+log_file = None
+patch = None
+
+if log_name != None:
+    log_file = open(log_name, "a")
+if patch_name != None:
+    patch = apatch.apatch(patch_name, patch_binary, log_file)
+
+# Locate the GCC binary
+if os.path.basename(sys.argv[0]) == "cwrapp":
+    try:
+        gcc.binary = sys.argv[1]
+        gcc_argv = sys.argv[2:]
+    except IndexError:
+        print >> sys.stderr, "No gcc frontend specified."
+        sys.exit(1)
+else:
+    gcc.binary = "%s/%s" % (gcc_prefix, os.path.basename(sys.argv[0]))
+    gcc_argv = sys.argv[1:]
+
+# Handle GCC arguments
+try:
+    args.parse(gcc_argv)
+except gcc_unhandled_exception:
+    print >> sys.stderr, "Warning: Pass-through mode enabled."
+    try:
+        gcc.launch(gcc_argv)
+        exit(0)
+    except subprocess.CalledProcessError, e:
+        exit(2)
+
+if len(args.sources) == 0:
+    print >> sys.stderr, "Error: No input files."
+    exit(1)
+
+if len(args.sources) > 1 and args.no_link:
+    print >> sys.stderr, "Error: '-c' and '-o' specified with multiple sources."
+    exit(1)
+
+tmpdir = None
+
+if not os.path.exists(profile_dir):
+    os.mkdir(profile_dir)
+
+try:
+    tmpdir = tempfile.mkdtemp(prefix = "cwrapp")
+
+    # XXX: Multiple files with same basename will break
+    for s in args.sources:
+        if extension(s) in no_compile_exts:
+            continue
+
+        tmp_file = "%s/%s" % (
+            tmpdir, new_extension(os.path.basename(s), "s"))
+        gcc.launch(args.next_argv + ["-S", "-o", tmp_file, s])
+
+        hash = file_hash(tmp_file)
+        asm_file_base = "%s.s" % (hash)
+        asm_file = "%s/%s" % (profile_dir, asm_file_base)
+        shutil.copy(tmp_file, asm_file)
+
+        if patch != None and asm_file_base in patch.sources:
+            patch.patch(asm_file_base,
+                        open(asm_file, "r"),
+                        open(tmp_file, "w"))
+            asm_file = tmp_file
+
+        obj_file = ""
+        if args.no_link:
+            if args.output == "":
+                obj_file = new_extension(s, "o")
+            else:
+                obj_file = args.output
+        else:
+            obj_file = new_extension(tmp_file, "o")
+
+        gcc.launch(args.next_argv + ["-c", "-g", "-o", obj_file, asm_file])
+
+    if not args.no_link:
+        link_argv = []
+        for a in args.argv:
+            if a in args.sources and extension(a) not in no_compile_exts:
+                link_argv.append("%s/%s" % (
+                        tmpdir, new_extension(os.path.basename(a), "o")))
+            else:
+                link_argv.append(a)
+
+        gcc.launch(link_argv)
+
+except subprocess.CalledProcessError, e:
+    print e
+    exit(2)
+#finally:
+#    if tmpdir != None:
+#        shutil.rmtree(tmpdir)
+
